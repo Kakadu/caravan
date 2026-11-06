@@ -1,6 +1,9 @@
 (* mybuild.exe — the Mybuild/dune build tool.
  *
  * Usage:
+ *   mybuild.exe confload <root> [template]
+ *       List configuration templates, or load <template> into conf/
+ *       (replacement for 'make confload-<template>').
  *   mybuild.exe gen-dune <root>
  *       Generate the dune workspace (build-dune/dune, helper scripts,
  *       gen/ files) for the configured platform.
@@ -39,6 +42,12 @@ let find_module (b : Model.build) (path : string) : Model.module_instance =
 (* ------------------------------------------------------------------ *)
 
 let cmd_gen_dune (root : string) : unit =
+  let mods_conf = root ^ "/conf/mods.conf" in
+  if not (Stdlib.Sys.file_exists mods_conf) then
+    die
+      "conf/mods.conf not found — load a template first:\n\
+       \   mybuild.exe confload %s [<template>]\n"
+      root;
   let b = load root in
   Dune_gen.emit_all root b
 
@@ -137,6 +146,7 @@ let usage () =
   Stdlib.output_string Stdlib.stderr
     "usage: mybuild.exe <command> <root> [args]\n\
      commands:\n\
+       confload [template]      load a configuration template (or list them)\n\
        gen-dune                 generate the dune workspace\n\
        mod-list                 list build modules\n\
        mod-brief <module>       module summary\n\
@@ -149,6 +159,9 @@ let () =
     let cmd = argv.(1) in
     let root = argv.(2) in
     (match cmd with
+     | "confload" ->
+         (if Array.length argv < 4 then Confload.list_templates root
+          else Confload.cmd_conf_load root argv.(3))
      | "gen-dune" -> cmd_gen_dune root
      | "mod-list" -> cmd_mod_list root
      | "mod-brief" ->
