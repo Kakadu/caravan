@@ -5,12 +5,14 @@ let readdir_r
       true)
   directory
   =
-  let handler = Core_unix.opendir directory in
+  let handler = Unix.opendir directory in
   let rec helper handler root acc =
-    let entry = Core_unix.readdir_opt handler in
+    let entry =
+      (try Some (Unix.readdir handler) with End_of_file -> None)
+    in
     match entry with
     | Some ent ->
-      let x = Core.String.concat ~sep:"/" [ root; ent ] in
+      let x = Base.String.concat ~sep:"/" [ root; ent ] in
       let xs =
         if Filename.basename x <> "." && Filename.basename x <> ".." && Sys.is_directory x
         then (
@@ -22,7 +24,7 @@ let readdir_r
         else []
       in
       (* let () = if cond x then Printf.printf "%s\n" x in *)
-      let xxs = Core.List.filter ~f:cond (x :: xs) in
+      let xxs = Base.List.filter ~f:cond (x :: xs) in
       (*error is there*)
       helper handler root (xxs @ acc)
     | None -> acc
@@ -52,12 +54,12 @@ let find ?(name = None) directory =
   match name with
   | Some cond ->
     let command = Printf.sprintf "find %s -name %s" directory cond in
-    let ic = Core_unix.open_process_in command in
-    Core.In_channel.input_lines ic
+    let ic = Unix.open_process_in command in
+    In_channel.input_lines ic
   | None ->
     let command = Printf.sprintf "find %s" directory in
-    let ic = Core_unix.open_process_in command in
-    Core.In_channel.input_lines ic
+    let ic = Unix.open_process_in command in
+    In_channel.input_lines ic
 ;;
 
 (* let%expect_test "find_test1" =

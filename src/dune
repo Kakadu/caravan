@@ -1,5 +1,5 @@
 (executable
  (public_name caravan)
  (name compiler)
- (libraries core core_unix.command_unix mybuild_parser mybuild_backend utils)
+ (libraries base mybuild_parser mybuild_backend utils)
  (modules compiler))

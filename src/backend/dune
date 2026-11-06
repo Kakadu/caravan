@@ -2,7 +2,7 @@
  (name mybuild_backend)
  (wrapped false)
  (modules genlib)
- (libraries mybuild_parser core_unix ocamlgraph))
+ (libraries mybuild_parser base unix ocamlgraph))
 
 ; (executable
 ;  (name gen)
