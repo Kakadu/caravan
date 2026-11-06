@@ -1,0 +1,15 @@
+(library
+ (name mybuild_model)
+ (wrapped false)
+ (libraries base unix mybuild_parser configfile_parser)
+ (modules model registry))
+
+(executable
+ (name smoke)
+ (modules smoke)
+ (libraries mybuild_model base))
+
+(executable
+ (name dump_hier)
+ (modules dump_hier)
+ (libraries mybuild_model base))
