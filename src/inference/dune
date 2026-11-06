@@ -1,0 +1,10 @@
+(library
+ (name mybuild_inference)
+ (wrapped false)
+ (libraries base mybuild_model)
+ (modules build))
+
+(executable
+ (name dump_build)
+ (modules dump_build)
+ (libraries mybuild_inference mybuild_model base))
