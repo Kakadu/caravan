@@ -34,7 +34,7 @@ rule read =
     parse 
     | whitespace        { read lexbuf }
     | newline           { new_line lexbuf; read lexbuf }
-    | number_literal    { NUM (float_of_string (Lexing.lexeme lexbuf)) }
+    | number_literal    { NUM (Lexing.lexeme lexbuf, float_of_string (Lexing.lexeme lexbuf)) }
     | "//"              { read_singleline_comment (Buffer.create 255) lexbuf; read lexbuf }
     | "/*"              { read_multiline_comment (Buffer.create 255) lexbuf; read lexbuf }
     | "true"            { TRUE }

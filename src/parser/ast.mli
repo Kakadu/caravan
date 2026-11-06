@@ -8,7 +8,7 @@ type composite_name_with_wildcard = composite_name [@@deriving show { with_path 
 
 type value =
   | StringLiteral of string
-  | NumberLiteral of float
+  | NumberLiteral of { lexeme : string; value : float }
   | BooleanLiteral of bool
   | Refer of composite_name
 [@@deriving show { with_path = false }]

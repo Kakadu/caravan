@@ -50,11 +50,22 @@
      (Annotation
         ("ann2",
          [([], (StringType, "str1", None));
-           ([], (NumberType, "num1", (Some (NumberLiteral 7.))));
-           ([], (NumberType, "num2", (Some (NumberLiteral 8.))));
-           ([], (NumberType, "num3", (Some (NumberLiteral -1.))));
-           ([], (NumberType, "hex1", (Some (NumberLiteral 61865.))));
-           ([], (NumberType, "hex2", (Some (NumberLiteral -160.))))])))
+           ([],
+            (NumberType, "num1",
+             (Some NumberLiteral {lexeme = "7"; value = 7.})));
+           ([],
+            (NumberType, "num2",
+             (Some NumberLiteral {lexeme = "8.0"; value = 8.})));
+           ([],
+            (NumberType, "num3",
+             (Some NumberLiteral {lexeme = "-1"; value = -1.})));
+           ([],
+            (NumberType, "hex1",
+             (Some NumberLiteral {lexeme = "0xF1A9"; value = 61865.})));
+           ([],
+            (NumberType, "hex2",
+             (Some NumberLiteral {lexeme = "-0xa0"; value = -160.})))
+           ])))
      ])
 
   $ cat << EOF > string_test.my

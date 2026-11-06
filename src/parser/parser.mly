@@ -3,7 +3,7 @@
 %}
 %token <string> ID
 %token <string> STR
-%token <float> NUM
+%token <string * float> NUM
 %token TRUE
 %token FALSE
 // 
@@ -178,7 +178,7 @@ parameter:
     | simple_reference = simple_reference; EQ; value = value { simple_reference, value };
 value:
     | str = STR { StringLiteral str }
-    | num = NUM { NumberLiteral num }
+    | num = NUM { NumberLiteral { lexeme = fst num; value = snd num } }
     | TRUE { BooleanLiteral (true) }
     | FALSE { BooleanLiteral (false) }
     | reference = reference { Refer reference };
