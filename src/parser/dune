@@ -6,9 +6,8 @@
 
 (library
  (name mybuild_parser)
- (wrapped false)
  ;  (public_name caravan.mybuild_pars1er)
- (libraries core)
+ (libraries base)
  (modules parser lexer ast parselib)
  (preprocess
   (pps ppx_deriving.show)))
@@ -17,4 +16,4 @@
  (name parse)
  (public_name caravan.parse)
  (modules parse)
- (libraries mybuild_parser core core_unix.command_unix))
+ (libraries mybuild_parser base))

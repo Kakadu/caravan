@@ -1,4 +1,4 @@
-open Core
+open Base
 open Lexing
 
 type source = string
@@ -11,9 +11,13 @@ type source = string
 
    let f = Parser.myfile_opt Lexer.read *)
 
-let print_position channel lexbuf =
+let position_string lexbuf =
   let pos = lexbuf.lex_curr_p in
-  fprintf channel "%s:%d:%d" pos.pos_fname pos.pos_lnum (pos.pos_cnum - pos.pos_bol + 1)
+  Stdlib.Format.asprintf "%s:%d:%d" pos.pos_fname pos.pos_lnum (pos.pos_cnum - pos.pos_bol + 1)
+;;
+
+let print_position channel lexbuf =
+  Out_channel.output_string channel (position_string lexbuf)
 ;;
 
 let parse_with_err ~source ~filename =
@@ -21,11 +25,11 @@ let parse_with_err ~source ~filename =
   lexbuf.lex_curr_p <- { lexbuf.lex_curr_p with pos_fname = filename };
   try Parser.myfile_opt Lexer.read lexbuf with
   | Lexer.Syntax_error msg ->
-    fprintf stderr "%a: %s\n" print_position lexbuf msg;
+    Out_channel.output_string Stdlib.stderr (position_string lexbuf ^ ": " ^ msg ^ "\n");
     None
   | Parser.Error ->
-    fprintf stderr "%a: Syntax error\n" print_position lexbuf;
-    exit (-1)
+    Out_channel.output_string Stdlib.stderr (position_string lexbuf ^ ": Syntax error\n");
+    Stdlib.exit (-1)
 ;;
 
 let parse_workspace_with_err ~input_filename_list =

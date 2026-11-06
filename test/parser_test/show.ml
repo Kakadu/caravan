@@ -1,4 +1,4 @@
-open! Ast
+open! Mybuild_parser.Ast
 
 let%expect_test _ =
   let tree : myfile = Some [ "lang_test"; "p" ], [], [] in
