@@ -82,6 +82,26 @@ let write_exec path content =
   write_file path content;
   Unix.chmod path 0o755
 
+let copy_file src dest =
+  let dir = Stdlib.Filename.dirname dest in
+  mkdir_p dir;
+  let ic = Stdlib.open_in_bin src in
+  let oc = Stdlib.open_out_bin dest in
+  try
+    let buf = Bytes.create 65536 in
+    let len = Bytes.length buf in
+    let rec loop () =
+      let n = Stdlib.input ic buf 0 len in
+      if n > 0 then (Stdlib.output oc buf 0 n; loop ())
+    in
+    loop ();
+    Stdlib.close_in ic;
+    Stdlib.close_out oc
+  with e ->
+    Stdlib.close_in_noerr ic;
+    Stdlib.close_out_noerr oc;
+    raise e
+
 (* ------------------------------------------------------------------ *)
 (* Small helpers                                                       *)
 (* ------------------------------------------------------------------ *)
@@ -400,8 +420,32 @@ let compile_rule (t : t) (m : Buildplan.module_plan) (s : Buildplan.source_plan)
     rule =
   let g = flags t in
   let dd = dirs t in
-  let src = abs_src t s in
   let d, b = split_target s.sp_obj_rel in
+  (* Sources produced by an extbld module live in the BUILD tree (sp_file
+   * starts with "build-dune/"): reference them cwd-relative in the action
+   * and order the compile after the owning extbld rule's stamp (the raw
+   * file is not a declared dune target, so it cannot be a dep). *)
+  let bd_src = String.is_prefix s.sp_file ~prefix:"build-dune/" in
+  let bd_rel =
+    if bd_src
+    then String.sub s.sp_file ~pos:11 ~len:(String.length s.sp_file - 11)
+    else s.sp_file
+  in
+  let src = if bd_src then rel_build d bd_rel else abs_src t s in
+  let src_dep =
+    if bd_src then
+      (match List.find_map t.plan.p_extbld ~f:(fun em ->
+               if String.is_prefix s.sp_file
+                   ~prefix:("build-dune/extbld/" ^ em.em_path ^ "/")
+               then Some
+                      (rel_build d
+                         ("extbld/" ^ em.em_path ^ "/install/.extbld-stamp"))
+               else None)
+       with
+       | Some dep -> dep
+       | None -> rel_build d bd_rel)
+    else abs_src t s
+  in
   let cmd =
     if Buildplan.kind_is_lds s.sp_kind then
       (* Linker-script sources may embed legacy build-base paths (e.g.
@@ -465,30 +509,49 @@ let compile_rule (t : t) (m : Buildplan.module_plan) (s : Buildplan.source_plan)
    *  $(INCLUDE_INSTALL_DIR)) are deliberately left absolute. *)
   let cmd =
     let cmd = Buildplan.replace_all cmd dd.obj (rel_build d "obj") in
-    Buildplan.replace_all cmd dd.bin (rel_build d "bin")
+    let cmd = Buildplan.replace_all cmd dd.bin (rel_build d "bin") in
+    (* -I flags from @IncludePath / @BuildArtifactPath that point into the
+     * extbld tree resolve in the build tree, not the source tree. *)
+    Buildplan.replace_all cmd (dd.build_dune ^ "/extbld") (rel_build d "extbld")
   in
   let cfg_hdr = abs_bd t ("gen/include/config/" ^ m.mp_path ^ ".h") in
   make_rule s.sp_obj_rel
-    ([ src; cfg_hdr; gen_stamp_dep t; rel_build d "inc.stamp" ] @ flag_file_deps d s)
+    ([ src_dep; cfg_hdr; gen_stamp_dep t; rel_build d "inc.stamp" ]
+     @ flag_file_deps d s)
     cmd
 
-(** Rule for an archive source: either the @Rule script (e.g. libgcc.a) or a
- *  plain copy from the source tree. The expanded @Rule script references
- *  the output by its absolute source-tree path; rewrite it to cwd-relative
- *  form (the action cwd is the output directory). *)
+(** Rule for an archive source: either the @Rule script (e.g. libgcc.a), a
+ *  plain copy from the source tree, or a copy of an extbld artifact
+ *  (produced by the extbld rule in the build tree, hence the dependency
+ *  must be a relative path resolving against the build tree). The expanded
+ *  @Rule script references the output by its absolute source-tree path;
+ *  rewrite it to cwd-relative form (the action cwd is the output
+ *  directory). *)
 let rule_source_rule (t : t) (s : Buildplan.source_plan) : rule =
   let d, b = split_target s.sp_obj_rel in
+  let is_extbld_artifact = String.is_prefix s.sp_file ~prefix:"build-dune/" in
+  (* sp_file is workspace-root-relative; rel_build expects paths relative
+   * to the build-dune root, so drop the "build-dune/" prefix. *)
+  let bd_rel =
+    if is_extbld_artifact
+    then String.sub s.sp_file ~pos:11 ~len:(String.length s.sp_file - 11)
+    else s.sp_file
+  in
   let cmd =
     match s.sp_rule with
     | Some script ->
         let s1 = Buildplan.replace_all script (abs_bd t s.sp_obj_rel) b in
         let s2 = Buildplan.replace_all s1 (abs_bd t d) "." in
         unescape_make s2
+    | None when is_extbld_artifact ->
+        "cp " ^ rel_build d bd_rel ^ " " ^ b
     | None -> "cp " ^ t.root ^ "/" ^ s.sp_file ^ " " ^ b
   in
   let deps =
     if Option.is_some s.sp_rule
     then [ gen_stamp_dep t ]
+    else if is_extbld_artifact
+    then [ rel_build d bd_rel; gen_stamp_dep t ]
     else [ t.root ^ "/" ^ s.sp_file; gen_stamp_dep t ]
   in
   make_rule s.sp_obj_rel deps cmd
@@ -605,52 +668,102 @@ let initfs_copy_rule (t : t) (src : string) (target : string) (chmod : string op
   in
   make_rule dst_rel [ t.root ^ "/" ^ src; gen_stamp_dep t ] cmd
 
-(** Single rule installing all @IncludeExport headers into the
- *  include-install directory (source tree, via the generated script). The
- *  target is a stamp file in the build tree; compile rules depend on it
- *  for ordering and invalidation. Dune 3.20 has no depfiles, so per-header
- *  tracking is not possible. *)
+(** board_config.h generation (mk/board_conf/board-conf-gen.mk). When the
+ *  template provides conf/board.conf.h, the legacy build compiles
+ *  mk/board_conf/gen_board_conf.c with the host compiler and runs it to
+ *  produce build/gen/include/config/board_config.h. Replicated as two
+ *  rules: host-compile the generator into obj/, then run it into
+ *  gen/include/config/ (already on the -I path). *)
+let board_conf_h_rel = "gen/include/config/board_config.h"
+
+let board_config_rules (t : t) : rule list =
+  let g = flags t in
+  let dd = dirs t in
+  let board_conf = dd.conf ^ "/board.conf.h" in
+  if not (Stdlib.Sys.file_exists board_conf) then []
+  else
+    (* Include set exactly like board-conf-gen.mk: conf/, board_config/,
+     * mk/board_conf/, plus ext_project/board_config (if present) and the
+     * CHIP_VENDOR / PLATFORM_VENDOR board_config dirs (if the variables
+     * are set). A missing -I dir is harmless to cc. *)
+    let incs =
+      [
+        "-I" ^ dd.conf;
+        "-I" ^ dd.root ^ "/board_config";
+        "-I" ^ dd.root ^ "/mk/board_conf";
+      ]
+      @ (if Stdlib.Sys.file_exists (dd.root ^ "/ext_project/board_config")
+         then [ "-I" ^ dd.root ^ "/ext_project/board_config" ]
+         else [])
+      @ (if String.is_empty g.gf_chip_vendor
+         then []
+         else
+           [ "-I" ^ dd.root ^ "/platform/" ^ g.gf_chip_vendor ^ "/board_config" ])
+      @ (if String.is_empty g.gf_platform_vendor
+         then []
+         else
+           [
+             "-I" ^ dd.root ^ "/platform/" ^ g.gf_platform_vendor
+             ^ "/board_config";
+           ])
+    in
+    let exe_rel = "obj/gen_board_conf" in
+    let compile =
+      make_rule exe_rel
+        [
+          board_conf;
+          dd.root ^ "/mk/board_conf/gen_board_conf.c";
+          dd.root ^ "/mk/board_conf/gen_board_conf.h";
+          gen_stamp_dep t;
+        ]
+        (cmd_of
+           ("cc" :: incs
+           @ [ "-o gen_board_conf"; dd.root ^ "/mk/board_conf/gen_board_conf.c" ]))
+    in
+    let gen =
+      let exe_rel_from_here = rel_build "gen/include/config" exe_rel in
+      (* Promote to the source tree: the compile rules' -I flags point at
+       * the source-tree build-dune/gen/include (all other generated
+       * headers live there, written by gen-dune). board_config.h is the
+       * only header produced at build time, so it must be copied back to
+       * the source tree to be visible to the -I. *)
+      make_rule ~promote:true board_conf_h_rel [ exe_rel_from_here ]
+        (exe_rel_from_here ^ " > board_config.h")
+    in
+    [ compile; gen ]
+
+(** Pure ordering/invalidation node: the headers themselves are
+ *  installed by gen-dune (see install_include_headers). The deps make
+ *  the stamp — and therefore every compile rule that depends on it —
+ *  rebuild when any exported header, the generated config, or
+ *  board_config.h changes. *)
 let include_install_rule (t : t) : rule =
   let deps =
     List.map t.plan.p_include_exports ~f:(fun (src_rel, _dest) ->
       t.root ^ "/" ^ src_rel)
-    @ [ gen_stamp_dep t; abs_bd t "scripts/include-install.sh" ]
+    @ [ gen_stamp_dep t ]
+    (* Order after the generated board_config.h, if the template has one.
+     * This rule's dune file sits in build-dune/, so the dep on the rule
+     * output is relative to that directory (dune rule outputs live in the
+     * build tree; an absolute path would be looked up in the source
+     * tree). *)
+    @ (match board_config_rules t with
+       | [] -> []
+       | _ -> [ board_conf_h_rel ])
   in
-  make_rule ~promote:true "inc.stamp" deps
-    ((abs_bd t "scripts/include-install.sh") ^ " && touch inc.stamp")
+  make_rule ~promote:true "inc.stamp" deps "touch inc.stamp"
 
-(** The generated include-install script (grouped by destination dir). *)
-let include_install_sh (t : t) : string =
+(** Install the @IncludeExport headers into the source-tree
+ *  build-dune/include/ (the compile rules' -I points there). Done at
+ *  gen-dune time — NOT by a dune rule — because dune rules must not
+ *  have source-tree side effects: if _build/ survives a confload wipe
+ *  of the source tree, an up-to-date rule is skipped and the side
+ *  effects are lost. *)
+let install_include_headers (t : t) : unit =
   let dd = dirs t in
-  let by_dir = Hashtbl.create ~size:64 (module String) in
+  wipe_dir_contents dd.inc_install;
   List.iter t.plan.p_include_exports ~f:(fun (src_rel, dest_rel) ->
-    let d = Stdlib.Filename.dirname dest_rel in
-    let d = if String.equal d "." then "" else d in
-    let b = Stdlib.Filename.basename dest_rel in
-    let cur =
-      match Hashtbl.find by_dir d with
-      | Some xs -> xs
-      | None -> []
-    in
-    Hashtbl.set by_dir ~key:d ~data:((src_rel, b) :: cur));
-  let buf = Buffer.create 8192 in
-  Buffer.add_string buf
-    ("#!/bin/bash\n"
-     ^ "# Generated by mybuild gen-dune. Do not edit.\n"
-     ^ "set -eu\n"
-     ^ "DEST=" ^ dd.inc_install ^ "\n"
-     ^ "rm -rf \"$DEST\"\n"
-     ^ "mkdir -p \"$DEST\"\n");
-  Hashtbl.to_alist by_dir
-  |> List.sort ~compare:(fun (a, _) (b, _) -> String.compare a b)
-  |> List.iter ~f:(fun (d, pairs) ->
-       if not (String.is_empty d) then
-         Buffer.add_string buf ("mkdir -p \"$DEST/" ^ d ^ "\"\n");
-       List.iter (List.rev pairs) ~f:(fun (src_rel, b) ->
-         Buffer.add_string buf
-           ("cp " ^ t.root ^ "/" ^ src_rel ^ " \"$DEST"
-            ^ (if String.is_empty d then "" else "/" ^ d) ^ "/" ^ b ^ "\"\n")));
-  Buffer.contents buf
+    copy_file (t.root ^ "/" ^ src_rel) (dd.inc_install ^ "/" ^ dest_rel))
 
 (** rootfs.cpio rule. *)
 let rootfs_cpio_rule (t : t) : rule =
@@ -709,9 +822,48 @@ let image_lds_rule (t : t) : rule =
   in
   make_rule "obj/image.lds" deps cmd
 
-(** Partial link (embox-2.o), final link (bin/embox), and bin/embox.bin. *)
+(** True when [tool] is an executable found in PATH. *)
+let in_path (tool : string) : bool =
+  let path =
+    Array.find_map (Unix.environment ()) ~f:(fun kv ->
+      if String.contains kv '=' then
+        let i = String.index_exn kv '=' in
+        if String.equal (String.sub kv ~pos:0 ~len:i) "PATH"
+        then Some (String.sub kv ~pos:(i + 1) ~len:(String.length kv - i - 1))
+        else None
+      else None)
+    |> Option.value ~default:""
+  in
+  String.split path ~on:':'
+  |> List.exists ~f:(fun d ->
+       let p = if String.is_empty d then tool else d ^ "/" ^ tool in
+       try
+         Unix.access p [ Unix.X_OK ] ;
+         true
+       with Unix.Unix_error _ -> false)
+
+(** True when the source text mentions __symbol_table (the legacy
+ *  image_has_symbol check on the partial link, approximated at
+ *  gen-dune time). *)
+let source_mentions_symtab (t : t) (s : Buildplan.source_plan) : bool =
+  let dd = dirs t in
+  let p =
+    if s.sp_generated then dd.gen ^ "/" ^ s.sp_file else t.root ^ "/" ^ s.sp_file
+  in
+  if not (Stdlib.Sys.file_exists p) then false
+  else
+    try
+      let ic = Stdlib.open_in_bin p in
+      let content = In_channel.input_all ic in
+      Stdlib.close_in_noerr ic;
+      Option.is_some (Buildplan.find_sub content "__symbol_table")
+    with _ -> false
+
+(** Partial link (embox-2.o), the symbol-table passes, final link
+ *  (bin/embox), and bin/embox.bin. *)
 let link_rules (t : t) : rule list =
   let g = flags t in
+  let dd = dirs t in
   let ld_objs =
     List.map t.plan.p_ld_modules ~f:(fun m -> rel_build "obj" ("module/" ^ m.mp_path ^ ".o"))
   in
@@ -741,27 +893,123 @@ let link_rules (t : t) : rule list =
       partial_cmd
   in
   let embox = "embox" in
+  (* Symbol-table passes (legacy mk/image3.mk L93-151): the image carries
+   * a self-describing table of its own symbols, generated in two passes
+   * (nm | nm2c.awk). The legacy gates this on image_has_symbol
+   * (__symbol_table_size in the partial link); we approximate it at
+   * gen-dune time by scanning the module sources. *)
+  let has_symtab =
+    List.exists t.plan.p_all ~f:(fun m ->
+      List.exists m.mp_sources ~f:(fun sp ->
+        if Buildplan.kind_is_cc sp.sp_kind then source_mentions_symtab t sp
+        else false))
+  in
+  let awk =
+    match List.find_map [ "gawk"; "awk"; "nawk"; "mawk" ] ~f:(fun tool ->
+            if in_path tool then Some tool else None)
+    with
+    | Some tool -> tool
+    | None -> "awk"
+  in
+  let nm = g.gf_cross ^ "nm" in
+  let nm_opts = "--demangle --line-numbers --numeric-sort" in
+  let symtab_rules =
+    if has_symtab then
+      let nosym =
+        make_rule "obj/image_nosymbols.o"
+          [ "embox-2.o"; "image.lds"; gen_stamp_dep t ]
+          (cmd_of
+             [
+               g.gf_cross ^ "ld";
+               "--relax";
+               g.gf_ldflags;
+               "--gc-sections";
+               "-T image.lds";
+               embox2;
+               "--defsym=__symbol_table=0";
+               "--defsym=__symbol_table_size=0";
+               "-o image_nosymbols.o";
+             ])
+      in
+      let gen_c (pass : string) (img : string) : rule =
+        make_rule ("obj/symbols_" ^ pass ^ ".c")
+          [ img; dd.root ^ "/mk/script/nm2c.awk"; gen_stamp_dep t ]
+          (cmd_of
+             [
+               nm;
+               nm_opts;
+               img;
+               "| " ^ awk ^ " -f " ^ dd.root ^ "/mk/script/nm2c.awk > symbols_"
+               ^ pass ^ ".c";
+             ])
+      in
+      let cc_sym (pass : string) : rule =
+        make_rule ("obj/symbols_" ^ pass ^ ".o")
+          [ "symbols_" ^ pass ^ ".c"; gen_stamp_dep t ]
+          (cmd_of
+             [
+               g.gf_cc;
+               g.gf_cflags;
+               g.gf_cppflags;
+               "-c -o symbols_" ^ pass ^ ".o symbols_" ^ pass ^ ".c";
+             ])
+      in
+      let ar_sym (pass : string) : rule =
+        make_rule ("obj/symbols_" ^ pass ^ ".a")
+          [ "symbols_" ^ pass ^ ".o" ]
+          (cmd_of
+             [ g.gf_cross ^ "ar"; "rcs symbols_" ^ pass ^ ".a symbols_" ^ pass ^ ".o" ])
+      in
+      let pass1_img =
+        make_rule "obj/image_pass1.o"
+          [ "embox-2.o"; "symbols_pass1.a"; "image.lds"; gen_stamp_dep t ]
+          (cmd_of
+             [
+               g.gf_cross ^ "ld";
+               "--relax";
+               g.gf_ldflags;
+               "--gc-sections";
+               "-T image.lds";
+               embox2;
+               "symbols_pass1.a";
+               "-o image_pass1.o";
+             ])
+      in
+      [
+        nosym;
+        gen_c "pass1" "image_nosymbols.o";
+        cc_sym "pass1";
+        ar_sym "pass1";
+        pass1_img;
+        gen_c "pass2" "image_pass1.o";
+        cc_sym "pass2";
+        ar_sym "pass2";
+      ]
+    else []
+  in
   let final_cmd =
     cmd_of
-      [
-        g.gf_cross ^ "ld";
-        "--relax";
-        g.gf_ldflags;
-        "--gc-sections";
-        "-T " ^ rel_build "bin" "obj/image.lds";
-        rel_build "bin" "obj/embox-2.o";
-        "--print-memory-usage";
-        "-o " ^ embox ^ " | tee " ^ embox ^ ".mem";
-      ]
+      (
+        [
+          g.gf_cross ^ "ld";
+          "--relax";
+          g.gf_ldflags;
+          "--gc-sections";
+          "-T " ^ rel_build "bin" "obj/image.lds";
+          rel_build "bin" "obj/embox-2.o";
+        ]
+        @ (if has_symtab then [ rel_build "bin" "obj/symbols_pass2.a" ] else [])
+        @ [ "--print-memory-usage"; "-o " ^ embox ^ " | tee " ^ embox ^ ".mem" ])
   in
   let final =
     make_rule "bin/embox"
-      [ rel_build "bin" "obj/embox-2.o"; rel_build "bin" "obj/image.lds"; gen_stamp_dep t ]
+      ((if has_symtab then [ rel_build "bin" "obj/symbols_pass2.a" ] else [])
+       @ [ rel_build "bin" "obj/embox-2.o"; rel_build "bin" "obj/image.lds"; gen_stamp_dep t ])
       final_cmd
   in
   let bin_cmd = cmd_of [ g.gf_cross ^ "objcopy"; "-O binary embox embox.bin" ] in
   let bin = make_rule "bin/embox.bin" [ "embox" ] bin_cmd in
-  [ partial; final; bin ]
+  [ partial ] @ symtab_rules @ [ final; bin ]
 
 (* ------------------------------------------------------------------ *)
 (* Whole dune workspace                                                *)
@@ -778,6 +1026,242 @@ let owned_sources (t : t) : (Buildplan.module_plan * Buildplan.source_plan) list
       else if Buildplan.kind_is_archive s.sp_kind then Some (m, s)
       else None))
 
+(* ------------------------------------------------------------------ *)
+(* External build (@Build) modules and toolchain wrappers              *)
+(* ------------------------------------------------------------------ *)
+
+(** Toolchain wrapper script, exactly as mk/extbld/gen_compilers.sh
+ *  generates it for COMPILER=gcc, non-dist. The EMBOX_IMPORTED_* values
+ *  are baked in at gen-dune time (mk/extbld/toolchain.mk L6-26); the
+ *  cross prefix is taken from the EMBOX_CROSS_COMPILE environment
+ *  variable at run time. The same text serves embox-gcc and embox-g++
+ *  (the command is derived from the script name). *)
+let toolchain_wrapper (t : t) : string =
+  let g = flags t in
+  let dd = dirs t in
+  (* EMBOX_IMPORTED_LDFLAGS_FULL (toolchain.mk L45-80), adapted to the
+   * single-stage link: the legacy references embox-1.o and the stage-1
+   * ar libs; here the only partial link is embox-2.o over all ar libs.
+   * Only used for EMBOX_GCC_LINK=full test links in configure scripts. *)
+  let ldflags_full =
+    "-Wl,--gc-sections -Wl,--relax -Wl,--entry=main"
+    ^ " -Wl,-T," ^ dd.obj ^ "/image.lds"
+    ^ " -Wl,--defsym=__symbol_table=0 -Wl,--defsym=__symbol_table_size=0"
+    ^ " " ^ dd.obj ^ "/embox-2.o"
+    ^ " -Wl,--start-group "
+    ^ String.concat ~sep:" "
+        (List.map t.plan.p_ar_modules ~f:(fun m ->
+           dd.build_dune ^ "/module/" ^ m.mp_path ^ ".a"))
+    ^ " -Wl,--end-group"
+  in
+  "#!/usr/bin/env bash\n\
+   \n\
+   # Auto-generated file. Do not edit.\n\
+   \n\
+   case \" $@ \" in\n\
+   \t*\" -shared \"* | \\\n\
+   \t*\" -pthread \"* | \\\n\
+   \t*\" -rdynamic \"*)\n\
+   \t\t$0 $(echo \" $@\" | sed \\\n\
+   \t\t-e 's/ -shared//g' \\\n\
+   \t\t-e 's/ -pthread//g' \\\n\
+   \t\t-e 's/ -rdynamic//g'); \\\n\
+   \t\texit $?;;\n\
+   esac\n\
+   \n\
+   case \" $@ \" in\n\
+   \t*\" -l\"*)      $0 $(for i in \"$@\"; do echo ${i/#-l*/}; done); exit $?;;\n\
+   \t*\" -I/usr/\"*) $0 $(for i in \"$@\"; do echo ${i/#-I\\/usr\\/*/}; done); exit $?;;\n\
+   esac\n\
+   \n\
+   EMBOX_IMPORTED_CPPFLAGS=\"" ^ g.gf_imported_cppflags ^ "\"\n\
+   EMBOX_IMPORTED_CFLAGS=\"" ^ g.gf_imported_cflags ^ "\"\n\
+   EMBOX_IMPORTED_M_CFLAGS=\"" ^ g.gf_imported_m_cflags ^ "\"\n\
+   EMBOX_IMPORTED_CXXFLAGS=\"" ^ g.gf_imported_cxxflags ^ "\"\n\
+   EMBOX_IMPORTED_LDFLAGS=\"" ^ g.gf_imported_ldflags ^ "\"\n\
+   EMBOX_IMPORTED_LDFLAGS_FULL=\"" ^ ldflags_full ^ "\"\n\
+   \n\
+   cppflags=\"$EMBOX_DEPS_CPPFLAGS_BEFORE $EMBOX_IMPORTED_CPPFLAGS $EMBOX_DEPS_CPPFLAGS_AFTER\"\n\
+   \n\
+   cmd=$(basename $0)\n\
+   cmd=${cmd#embox-}\n\
+   \n\
+   case $cmd in\n\
+   \tgcc|clang)   arg_line_before=\"$EMBOX_IMPORTED_CFLAGS\";;\n\
+   \tg++|clang++) arg_line_before=\"$EMBOX_IMPORTED_CXXFLAGS\";;\n\
+   esac\n\
+   \n\
+   arg_line_after=\"$cppflags $EMBOX_IMPORTED_LDFLAGS -Wl,-r\"\n\
+   \n\
+   if [[ \"$EMBOX_GCC_LINK\" == \"full\" ]]; then\n\
+   arg_line_after=\"$cppflags $EMBOX_IMPORTED_LDFLAGS $EMBOX_IMPORTED_LDFLAGS_FULL\"\n\
+   fi\n\
+   \n\
+   case \" $@ \" in\n\
+   \t*\" -c \"*) arg_line_after=\"$cppflags\";;\n\
+   \t*\" -E \"*) arg_line_after=\"$cppflags\"; arg_line_before=\"$EMBOX_IMPORTED_M_CFLAGS\";;\n\
+   esac\n\
+   \n\
+   ${EMBOX_CROSS_COMPILE}$cmd $arg_line_before \"$@\" $arg_line_after\n\
+   exit $?\n"
+
+(** True when [tool] is found in PATH (this stdlib has no
+ *  Sys.executable_exists). *)
+
+(** Regular files of a directory (dotfiles skipped), sorted. *)
+let dir_files (dir : string) : string list =
+  try
+    Stdlib.Sys.readdir dir
+    |> Array.to_list
+    |> List.filter ~f:(fun n -> not (String.is_prefix n ~prefix:"."))
+    |> List.map ~f:(fun n -> dir ^ "/" ^ n)
+    |> List.filter ~f:(fun p ->
+           Stdlib.Sys.file_exists p && not (Stdlib.Sys.is_directory p))
+    |> List.sort ~compare:String.compare
+  with Sys_error _ -> []
+
+(** Rule running one @Build module's Makefile through
+ *  mk/extbld/build.mk (legacy mk/extbld.mk EXTERNAL_MAKE). The module
+ *  Makefile is invoked with -C <Mybuild dir>; MOD_BUILD_DIR points into
+ *  the build tree (build-dune/extbld/<path>) so dune tracks the produced
+ *  artifacts. The install artifacts are the rule targets.
+ *
+ *  NB: dune does NOT expand $(builddir) in bash actions (verified), so
+ *  the build-tree location is derived at run time from the action cwd,
+ *  which is the build-tree mirror of this rule's directory
+ *  (<builddir>/build-dune/extbld/<path>/install). *)
+let extbld_rule (t : t) (em : Buildplan.extbld_module) : rule =
+  let g = flags t in
+  let dd = dirs t in
+  let mod_dir = dd.root ^ "/" ^ em.em_mybuild_dir in
+  let wrapper = dd.build_dune ^ "/toolchain" in
+  (* Tool variables exported by mk/variables.mk in the legacy flow
+   * (resolved the same way: first candidate found in PATH). *)
+  let md5 = if in_path "md5sum" then "md5sum" else "md5 -q" in
+  let awk =
+    match List.find_map [ "gawk"; "awk"; "nawk"; "mawk" ] ~f:(fun tool ->
+            if in_path tool then Some tool else None)
+    with
+    | Some tool -> tool
+    | None -> "awk"
+  in
+  let triplet =
+    if String.equal g.gf_arch "x86"
+    then "i386-unknown-none"
+    else g.gf_arch ^ "-unknown-none"
+  in
+  (* Ascents from the action cwd (<builddir>/build-dune/extbld/<path>/
+   * install) to the build-tree root. *)
+  let cd_ups =
+    String.concat ~sep:""
+      (List.init (List.length (String.split em.em_path ~on:'/') + 3)
+         ~f:(fun _ -> "../"))
+  in
+  (* EMBOX_CPPFLAGS (extbld.mk L31): dep cppflags before/after around
+   * EMBOX_EXPORT_CPPFLAGS. *)
+  let embox_cppflags =
+    em.em_bd_cppflags_before
+    ^ (if String.is_empty g.gf_export_cppflags then ""
+       else " " ^ g.gf_export_cppflags)
+    ^ (if String.is_empty em.em_bd_cppflags_after then ""
+       else " " ^ em.em_bd_cppflags_after)
+  in
+  let embox_ldflags =
+    g.gf_ldflags
+    ^ (if String.is_empty em.em_bd_ldflags then "" else " " ^ em.em_bd_ldflags)
+  in
+  (* The extbld make runs with cwd in the SOURCE tree (make -C <mod_dir>),
+   * so build-tree paths in the dep flags cannot be cwd-relative; they are
+   * spelled with $(BTR), the build-tree root resolved at run time and
+   * passed to make on the command line. *)
+  let btr (x : string) : string =
+    Buildplan.replace_all x (dd.build_dune ^ "/extbld")
+      "$(BTR)/build-dune/extbld"
+  in
+  let embox_cppflags = btr embox_cppflags in
+  let embox_ldflags = btr embox_ldflags in
+  let bd_before = btr em.em_bd_cppflags_before in
+  let bd_after = btr em.em_bd_cppflags_after in
+  let module_cppflags =
+    "-include " ^ dd.gen ^ "/include/config/" ^ em.em_path ^ ".h"
+    ^ " -D__EMBUILD_MOD__=" ^ em.em_id
+  in
+  let cmd =
+    String.concat ~sep:" "
+      [
+        (* Wipe the module's build-tree state (stamps, extracted sources)
+         * before invoking make. The rule only re-runs when something that
+         * affects the extbld build changed (module files, conf/Mybuild
+         * hash, wrappers, config header) or the targets were removed —
+         * in all those cases a clean make run is required: stale stamps
+         * from a previous configuration would make the module Makefile
+         * skip the rebuild ("Nothing to be done") while dune has already
+         * deleted the targets, so the rule would fail. The download
+         * cache (<root>/download) is outside MOD_BUILD_DIR and survives. *)
+        "D=$(pwd)";
+        "&&";
+        "rm -rf \"$(dirname \"$D\")\"";
+        "&&";
+        "mkdir -p \"$D\"";
+        "&&";
+        "cd \"$D\"";
+        "&&";
+        (* Build-tree root: ups = depth of the install dir. *)
+        "BTR=$(cd " ^ cd_ups ^ " && pwd)";
+        "&&";
+        "EMBOX_GCC=" ^ wrapper ^ "/embox-gcc";
+        "EMBOX_GXX=" ^ wrapper ^ "/embox-g++";
+        "EMBOX_CC=" ^ wrapper ^ "/embox-gcc";
+        "EMBOX_CXX=" ^ wrapper ^ "/embox-g++";
+        "EMBOX_CROSS_COMPILE=" ^ sh_arg g.gf_cross;
+        "ROOT_DIR=" ^ sh_arg dd.root;
+        "make";
+        "-C " ^ sh_arg mod_dir;
+        "-f " ^ sh_arg (dd.root ^ "/mk/extbld/build.mk");
+        "MAKEFLAGS=";
+        "EMBOX_MAKEFLAGS=";
+        "EMBOX_IMPORTED_MAKEFLAGS=";
+        "MOD_DIR=" ^ sh_arg mod_dir;
+        (* The action cwd is <builddir>/build-dune/extbld/<path>/install. *)
+        "MOD_BUILD_DIR=$(dirname $(pwd))";
+        "MKDIR=" ^ sh_arg "mkdir -p";
+        "RM=" ^ sh_arg "rm -f";
+        "CP=" ^ sh_arg "cp";
+        "MD5=" ^ sh_arg md5;
+        "AWK=" ^ sh_arg awk;
+        "AUTOCONF_TARGET_TRIPLET=" ^ triplet;
+        "EMBOX_ARCH=" ^ g.gf_arch;
+        "EMBOX_COMPILER=gcc";
+        "EMBOX_CFLAGS=" ^ sh_arg g.gf_cflags;
+        "EMBOX_CXXFLAGS=" ^ sh_arg g.gf_cxxflags;
+        "EMBOX_CPPFLAGS=" ^ sh_arg embox_cppflags;
+        "EMBOX_LDFLAGS=" ^ sh_arg embox_ldflags;
+        "EMBOX_DEPS_CPPFLAGS_BEFORE=" ^ sh_arg bd_before;
+        "EMBOX_DEPS_CPPFLAGS_AFTER=" ^ sh_arg bd_after;
+        "EMBOX_MODULE_CPPFLAGS=" ^ sh_arg module_cppflags;
+        "BTR=$BTR";
+        "&&";
+        "touch .extbld-stamp";
+      ]
+  in
+  let deps =
+    dir_files mod_dir
+    @ [
+      gen_stamp_dep t;
+      wrapper ^ "/embox-gcc";
+      wrapper ^ "/embox-g++";
+      dd.gen ^ "/include/config/" ^ em.em_path ^ ".h";
+    ]
+  in
+  (* The stamp is always a target: modules without install artifacts
+   * (download/extract/patch only, e.g. acpica) need it as the ordering
+   * point for compile rules on their build-tree sources. *)
+  make_rule
+    ("extbld/" ^ em.em_path ^ "/install/"
+     ^ String.concat ~sep:" " (em.em_targets @ [ ".extbld-stamp" ]))
+    deps
+    cmd
+
 (** Collect every rule of the build. *)
 let collect_rules (t : t) : rule list =
   let rules = ref [] in
@@ -790,6 +1274,9 @@ let collect_rules (t : t) : rule list =
   List.iter t.plan.p_initfs ~f:(fun (src, target, chmod) ->
     rules := initfs_copy_rule t src target chmod :: !rules);
   rules := include_install_rule t :: !rules;
+  rules := List.append (board_config_rules t) !rules;
+  List.iter t.plan.p_extbld ~f:(fun em ->
+    rules := extbld_rule t em :: !rules);
   rules := rootfs_cpio_rule t :: !rules;
   rules := image_lds_rule t :: !rules;
   List.iter (link_rules t) ~f:(fun r -> rules := r :: !rules);
@@ -906,6 +1393,11 @@ let emit_all (root : string) (b : Model.build) : unit =
    *  -I dirs, which breaks <../../src/...> includes). *)
   mkdir_p (dd.gen ^ "/src/include");
 
+  (* Target dir of the board_config.h rule (dune requires the target's
+   *  directory to exist in the source tree). *)
+  if Stdlib.Sys.file_exists (root ^ "/conf/board.conf.h")
+  then mkdir_p (dd.gen ^ "/include/config");
+
   (* 2. Invalidation stamp. *)
   write_file (dd.gen ^ "/gen.stamp") (gen_stamp root);
 
@@ -913,7 +1405,21 @@ let emit_all (root : string) (b : Model.build) : unit =
   write_exec (dd.build_dune ^ "/scripts/module-link.sh") module_link_sh;
   write_exec (dd.build_dune ^ "/scripts/module-ar.sh") module_ar_sh;
   write_exec (dd.build_dune ^ "/scripts/rootfs.sh") rootfs_sh;
-  write_exec (dd.build_dune ^ "/scripts/include-install.sh") (include_install_sh t);
+
+  (* 3a. @IncludeExport headers: installed directly into the source tree
+   * (see install_include_headers for why this is not a dune rule). *)
+  install_include_headers t;
+
+  (* 3b. Toolchain wrappers for extbld builds (mk/extbld/toolchain.mk).
+   *  Written into the source tree; extbld rules depend on them. *)
+  let wrapper = toolchain_wrapper t in
+  write_exec (dd.build_dune ^ "/toolchain/embox-gcc") wrapper;
+  write_exec (dd.build_dune ^ "/toolchain/embox-g++") wrapper;
+
+  (* 3c. Extbld install dirs (dune requires the rule target's directory
+   *  to exist in the source tree). *)
+  List.iter t.plan.p_extbld ~f:(fun em ->
+    mkdir_p (dd.build_dune ^ "/extbld/" ^ em.em_path ^ "/install"));
 
   (* 4. Dune files: one per output directory (dune requires targets to live
    *  in the dune file's own directory). *)
@@ -929,6 +1435,7 @@ let emit_all (root : string) (b : Model.build) : unit =
   write_file (root ^ "/dune") root_dune;
   write_file (root ^ "/dune-project") dune_project;
   Stdlib.Format.printf
-    "gen-dune: %d headers, %d modules (%d ld, %d ar), %d initfs files\n%!"
+    "gen-dune: %d headers, %d modules (%d ld, %d ar), %d initfs files, %d extbld\n%!"
     n_hdr (List.length p.p_modules) (List.length p.p_ld_modules)
     (List.length p.p_ar_modules) (List.length p.p_initfs)
+    (List.length p.p_extbld)
