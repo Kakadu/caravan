@@ -1,0 +1,30 @@
+(library
+ (name mybuild_emitter)
+ (wrapped false)
+ (libraries base unix mybuild_inference mybuild_model)
+ (modules ctx headers modinject sections modinfo lds buildplan dune_gen))
+
+(executable
+ (name gen_headers)
+ (modules gen_headers)
+ (libraries mybuild_emitter mybuild_inference mybuild_model base))
+
+(executable
+ (name gen_sources)
+ (modules gen_sources)
+ (libraries mybuild_emitter mybuild_inference mybuild_model base))
+
+(executable
+ (name gen_lds)
+ (modules gen_lds)
+ (libraries mybuild_emitter mybuild_inference mybuild_model base))
+
+(executable
+ (name probe_plan)
+ (modules probe_plan)
+ (libraries mybuild_emitter mybuild_inference mybuild_model base))
+
+(executable
+ (name debug_bm)
+ (modules debug_bm)
+ (libraries mybuild_emitter mybuild_inference mybuild_model base))
